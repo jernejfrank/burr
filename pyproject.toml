@@ -45,7 +45,8 @@ aiosqlite = [
 ]
 
 postgresql = [
-  "psycopg2-binary"
+  "psycopg2-binary",
+  "asyncpg",
 ]
 
 redis = [
