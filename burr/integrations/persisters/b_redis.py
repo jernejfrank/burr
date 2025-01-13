@@ -2,6 +2,7 @@ from burr.integrations import base
 
 try:
     import redis  # can't name module redis because this import wouldn't work.
+    import redis.asyncio as aredis
 
 except ImportError as e:
     base.require_plugin(e, "redis")
@@ -215,6 +216,171 @@ class RedisPersister(RedisBasePersister):
             host=host, port=port, db=db, password=password, **redis_client_kwargs
         )
         super(RedisPersister, self).__init__(connection, serde_kwargs, namespace)
+
+
+class AsyncRedisBasePersister(persistence.BaseStatePersister):
+    """Main class for Async Redis persister.
+
+    Use this class if you want to directly control injecting the async Redis client.
+
+    .. warning::
+        The synchronous persister closes the connection on deletion of the class using the ``__del__`` method.
+        In an async context that is not reliable (the event loop may already be closed by the time ``__del__``
+        gets invoked). Therefore, you are responsible for closing the connection yourself (i.e. manual cleanup).
+
+
+    This class is responsible for async persisting state data to a Redis database.
+    It inherits from the BaseStatePersister class.
+    """
+
+    @classmethod
+    def from_values(
+        cls,
+        host: str,
+        port: int,
+        db: int,
+        password: str = None,
+        serde_kwargs: dict = None,
+        redis_client_kwargs: dict = None,
+        namespace: str = None,
+    ) -> "AsyncRedisBasePersister":
+        """Creates a new instance of the AsyncRedisBasePersister from passed in values."""
+        if redis_client_kwargs is None:
+            redis_client_kwargs = {}
+        connection = aredis.Redis(
+            host=host, port=port, db=db, password=password, **redis_client_kwargs
+        )
+        return cls(connection, serde_kwargs, namespace)
+
+    def __init__(
+        self,
+        connection,
+        serde_kwargs: dict = None,
+        namespace: str = None,
+    ):
+        """Initializes the AsyncRedisPersister class.
+
+        :param connection: the redis connection object.
+        :param serde_kwargs: serialization and deserialization keyword arguments to pass to state SERDE.
+        :param namespace: The name of the project to optionally use in the key prefix.
+        """
+        self.connection = connection
+        self.serde_kwargs = serde_kwargs or {}
+        self.namespace = namespace if namespace else ""
+
+    async def list_app_ids(self, partition_key: str, **kwargs) -> list[str]:
+        """List the app ids for a given partition key."""
+        namespaced_partition_key = (
+            f"{self.namespace}:{partition_key}" if self.namespace else partition_key
+        )
+        app_ids = await self.connection.zrevrange(namespaced_partition_key, 0, -1)
+        return [app_id.decode() for app_id in app_ids]
+
+    async def load(
+        self, partition_key: str, app_id: str, sequence_id: int = None, **kwargs
+    ) -> Optional[persistence.PersistedStateData]:
+        """Load the state data for a given partition key, app id, and sequence id.
+
+        If the sequence id is not given, it will be looked up in the Redis database. If it is not found, None will be returned.
+
+        :param partition_key:
+        :param app_id:
+        :param sequence_id:
+        :param kwargs:
+        :return: Value or None.
+        """
+        namespaced_partition_key = (
+            f"{self.namespace}:{partition_key}" if self.namespace else partition_key
+        )
+        if sequence_id is None:
+            sequence_id = await self.connection.zscore(namespaced_partition_key, app_id)
+            if sequence_id is None:
+                return None
+            sequence_id = int(sequence_id)
+        key = await self.create_key(app_id, partition_key, sequence_id)
+        data = await self.connection.hgetall(key)
+        if not data:
+            return None
+        _state = state.State.deserialize(json.loads(data[b"state"].decode()), **self.serde_kwargs)
+        return {
+            "partition_key": partition_key,
+            "app_id": app_id,
+            "sequence_id": sequence_id,
+            "position": data[b"position"].decode(),
+            "state": _state,
+            "created_at": data[b"created_at"].decode(),
+            "status": data[b"status"].decode(),
+        }
+
+    async def create_key(self, app_id, partition_key, sequence_id):
+        """Create a key for the Redis database."""
+        if self.namespace:
+            key = f"{self.namespace}:{partition_key}:{app_id}:{sequence_id}"
+        else:
+            key = f"{partition_key}:{app_id}:{sequence_id}"
+        return key
+
+    async def save(
+        self,
+        partition_key: str,
+        app_id: str,
+        sequence_id: int,
+        position: str,
+        state: state.State,
+        status: Literal["completed", "failed"],
+        **kwargs,
+    ):
+        """Save the state data to the Redis database.
+
+        :param partition_key:
+        :param app_id:
+        :param sequence_id:
+        :param position:
+        :param state:
+        :param status:
+        :param kwargs:
+        :return:
+        """
+        key = await self.create_key(app_id, partition_key, sequence_id)
+        if await self.connection.exists(key):
+            raise ValueError(f"partition_key:app_id:sequence_id[{key}] already exists.")
+        json_state = json.dumps(state.serialize(**self.serde_kwargs))
+        await self.connection.hset(
+            key,
+            mapping={
+                "partition_key": partition_key,
+                "app_id": app_id,
+                "sequence_id": sequence_id,
+                "position": position,
+                "state": json_state,
+                "status": status,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        namespaced_partition_key = (
+            f"{self.namespace}:{partition_key}" if self.namespace else partition_key
+        )
+        await self.connection.zadd(namespaced_partition_key, {app_id: sequence_id})
+
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        if not hasattr(self.connection, "connection_pool"):
+            logger.warning("Redis connection is not serializable.")
+            return state
+        state["connection_params"] = {
+            "host": self.connection.connection_pool.connection_kwargs["host"],
+            "port": self.connection.connection_pool.connection_kwargs["port"],
+            "db": self.connection.connection_pool.connection_kwargs["db"],
+            "password": self.connection.connection_pool.connection_kwargs["password"],
+        }
+        del state["connection"]
+        return state
+
+    def __setstate__(self, state: dict):
+        connection_params = state.pop("connection_params")
+        # we assume normal redis client.
+        self.connection = aredis.Redis(**connection_params)
+        self.__dict__.update(state)
 
 
 if __name__ == "__main__":
